@@ -1,5 +1,6 @@
 from tfscreen.analysis.hierarchical.run_inference import RunInference
 from tfscreen.analysis.hierarchical.growth_model import GrowthModel
+from tfscreen.analysis.hierarchical.summarize_posteriors import summarize_posteriors
 from tfscreen.util.cli.generalized_main import generalized_main
 
 import os
@@ -13,10 +14,16 @@ def _run_map(ri,
              adam_final_step_size=1e-6,
              adam_clip_norm=1.0,
              elbo_num_particles=2,
-             convergence_tolerance=1e-5,
-             convergence_window=1000,
-             checkpoint_interval=1000,
-             map_num_steps=100000):
+             convergence_tolerance=0.01,
+             convergence_window=10,
+             patience=10,
+             convergence_check_interval=2,
+             checkpoint_interval=10,
+             max_num_epochs=100000,
+             num_posterior_samples=10000,
+             sampling_batch_size=100,
+             forward_batch_size=512,
+             always_get_posterior=False):
     """
     Run maximum a posteriori (MAP) optimization for hierarchical model inference.
 
@@ -43,14 +50,22 @@ def _run_map(ri,
         Gradient clipping norm for Adam optimizer (default 1.0).
     elbo_num_particles : int, optional
         Number of particles for ELBO estimation during MAP (default 2).
+    max_num_epochs : int, optional
+        Maximum number of MAP optimization epochs (default 100000).
     convergence_tolerance : float, optional
-        Relative change in loss to declare MAP convergence (default 1e-5).
+        Relative change in smoothed loss to declare MAP convergence (default 0.01).
     convergence_window : int, optional
-        Number of steps to average for convergence check (default 1000).
+        Number of epochs to average for convergence check (default 10).
+    patience : int, optional
+        Number of consecutive checks meeting tolerance to declare convergence
+        (default 10).
+    convergence_check_interval : int, optional
+        Frequency (in epochs) to check for convergence (default 2).
     checkpoint_interval : int, optional
-        Steps between checkpoints and convergence checks (default 1000).
-    map_num_steps : int, optional
-        Number of MAP optimization steps (default 100000).
+        Steps between checkpoints and convergence checks (default 10).
+    map_guide_type : str, optional
+        Type of guide to use for MAP. Allowed values are 'laplace',
+        'diagonal_laplace' (default), 'normal', or 'delta'.
 
     Returns
     -------
@@ -62,20 +77,18 @@ def _run_map(ri,
         True if MAP converged according to the specified tolerance.
     """
 
-     # Create a learning rate schedule
+    # Create a learning rate schedule
     schedule = optax.exponential_decay(
         init_value=adam_step_size,
-        transition_steps=int(map_num_steps * 0.25),
+        transition_steps=int(max_num_epochs * ri._iterations_per_epoch * 1.0),
         decay_rate=adam_final_step_size / adam_step_size
     )
 
      # Create a maximum a posteriori svi object
-    map_obj = ri.setup_map(adam_step_size=schedule,
+    map_obj = ri.setup_svi(adam_step_size=schedule,
                            adam_clip_norm=adam_clip_norm,
-                           elbo_num_particles=elbo_num_particles)
-    
-    if os.path.isfile(f"{out_root}_losses.csv"):
-        os.remove(f"{out_root}_losses.csv")
+                           elbo_num_particles=elbo_num_particles,
+                           guide_type="delta")
 
     # Run MAP
     svi_state, params, converged = ri.run_optimization(
@@ -85,8 +98,10 @@ def _run_map(ri,
         svi_state=checkpoint_file,
         convergence_tolerance=convergence_tolerance,
         convergence_window=convergence_window,
+        patience=patience,
+        convergence_check_interval=convergence_check_interval,
         checkpoint_interval=checkpoint_interval,
-        num_steps=map_num_steps,
+        max_num_epochs=max_num_epochs,
     )
 
     # Write the current parameter values
@@ -108,10 +123,12 @@ def _run_svi(ri,
              adam_final_step_size=1e-6,
              adam_clip_norm=1.0,
              elbo_num_particles=2,
-             convergence_tolerance=1e-4,
-             convergence_window=1000,
-             checkpoint_interval=1000,
-             num_steps=100000,
+             convergence_tolerance=0.01,
+             convergence_window=10,
+             patience=10,
+             convergence_check_interval=2,
+             checkpoint_interval=10,
+             max_num_epochs=100000,
              num_posterior_samples=10000,
              sampling_batch_size=100,
              forward_batch_size=512,
@@ -143,13 +160,18 @@ def _run_svi(ri,
     elbo_num_particles : int, optional
         Number of particles for ELBO estimation during SVI (default 2).
     convergence_tolerance : float, optional
-        Relative change in loss to declare SVI convergence (default 1e-4).
+        Relative change in loss to declare SVI convergence (default 0.01).
     convergence_window : int, optional
-        Number of steps to average for convergence check (default 1000).
+        Number of epochs to average for convergence check (default 10).
+    patience : int, optional
+        Number of consecutive checks meeting tolerance to declare convergence
+        (default 10).
+    convergence_check_interval : int, optional
+        Frequency (in epochs) to check for convergence (default 2).
     checkpoint_interval : int, optional
-        Steps between checkpoints and convergence checks (default 1000).
-    num_steps : int, optional
-        Number of SVI optimization steps (default 100000).
+        Frequency (in epochs) between checkpoints (default 10).
+    max_num_epochs : int, optional
+        Maximum number of SVI optimization epochs (default 100000).
     num_posterior_samples : int, optional
         Number of posterior samples to draw after convergence (default 10000).
     sampling_batch_size : int, optional
@@ -174,7 +196,7 @@ def _run_svi(ri,
     # Create a learning rate schedule
     schedule = optax.exponential_decay(
         init_value=adam_step_size,
-        transition_steps=int(num_steps * 0.25),
+        transition_steps=int(max_num_epochs * ri._iterations_per_epoch * 1.0),
         decay_rate=adam_final_step_size / adam_step_size
     )
 
@@ -182,27 +204,36 @@ def _run_svi(ri,
     svi_obj = ri.setup_svi(adam_step_size=schedule,
                            adam_clip_norm=adam_clip_norm,
                            elbo_num_particles=elbo_num_particles,
-                           init_params=init_params)
+                           guide_type="component")
  
-    # Run svi
+    # Run svi. Note that `init_params` is not used here, but is required by the
+    # run_optimization method.
     svi_state, params, converged = ri.run_optimization(
         svi_obj,
-        init_params=None, # init_params captured during svi_obj initialization
+        init_params=init_params, 
         out_root=f"{out_root}",
         svi_state=checkpoint_file,
         convergence_tolerance=convergence_tolerance,
         convergence_window=convergence_window,
+        patience=patience,
+        convergence_check_interval=convergence_check_interval,
         checkpoint_interval=checkpoint_interval,
-        num_steps=num_steps,
+        max_num_epochs=max_num_epochs,
     )
 
     if converged or always_get_posterior:
+
         ri.get_posteriors(svi=svi_obj,
                           svi_state=svi_state,
                           out_root=out_root,
                           num_posterior_samples=num_posterior_samples,
                           sampling_batch_size=sampling_batch_size,
                           forward_batch_size=forward_batch_size)
+        
+        # Write summary files
+        summarize_posteriors(posterior_file=f"{out_root}_posterior.h5",
+                             config_file=f"{out_root}_config.yaml",
+                             out_root=out_root)
         
     # Write convergence information to stdout
     if converged:
@@ -213,16 +244,18 @@ def _run_svi(ri,
     return svi_state, params, converged
 
     
-def analyze_theta(growth_df,
-                  binding_df,
-                  seed,
+def analyze_theta(growth_df=None,
+                  binding_df=None,
+                  seed=None,
+                  config_file=None,
                   condition_growth_model="hierarchical",
                   ln_cfu0_model="hierarchical",
                   dk_geno_model="hierarchical",
                   activity_model="horseshoe",
                   theta_model="hill",
-                  theta_growth_noise_model="beta",
-                  theta_binding_noise_model="beta",
+                  transformation_model="congression",
+                  theta_growth_noise_model="none",
+                  theta_binding_noise_model="none",
                   checkpoint_file=None,
                   analysis_method="svi",
                   out_root="tfs",
@@ -230,10 +263,12 @@ def analyze_theta(growth_df,
                   adam_final_step_size=1e-6,
                   adam_clip_norm=1.0,
                   elbo_num_particles=2,
-                  convergence_tolerance=1e-6,
-                  convergence_window=10000,
-                  checkpoint_interval=10000,
-                  num_steps=100000,
+                  convergence_tolerance=0.01,
+                  convergence_window=10,
+                  patience=10,
+                  convergence_check_interval=2,
+                  checkpoint_interval=10,
+                  max_num_epochs=100000,
                   batch_size=1024,
                   num_posterior_samples=10000,
                   sampling_batch_size=100,
@@ -253,12 +288,16 @@ def analyze_theta(growth_df,
 
     Parameters
     ----------
-    growth_df : pandas.DataFrame
+    growth_df : pandas.DataFrame or str, optional
         Input data for the growth model (e.g., genotype/cfu measurements).
-    binding_df : pandas.DataFrame
+        If config_file is provided, this overrides the config path.
+    binding_df : pandas.DataFrame or str, optional
         Input data for the binding model (e.g., theta vs. titrant measurements)
-    seed : int
-        Random seed for reproducibility.
+        If config_file is provided, this overrides the config path.
+    seed : int, optional
+        Random seed for reproducibility. Must be provided if not loading from SVI.
+    config_file : str, optional
+        Path to a YAML configuration file to load settings from.
     condition_growth_model: str, optional
         model to use to describe growth under different conditions (e.g., 
         pheS+4CP). Allowed values are 'hierarchical' (default) or 'independent'.
@@ -278,6 +317,9 @@ def analyze_theta(growth_df,
         model to use to describe theta, the fractional occupancy of a genotype
         on the transcription factor binding site. Allowed values are 'hill' 
         (default) or 'categorical'. 
+    transformation_model : str, optional
+        model for transformation correction. Allowed values are 'congression'
+        (default) or 'single'.
     theta_growth_noise_model : str, optional
         model to use for stochastic experimental noise in theta measured by 
         bacterial growth. Allowed values are 'beta' (default) or 'none' (written
@@ -288,6 +330,9 @@ def analyze_theta(growth_df,
         string)
     checkpoint_file : str or None, optional
         Path to a checkpoint file to resume SVI from, or None to start fresh.
+    analysis_method : str, optional
+        Method for inference. Allowed values are 'svi' (default), 'map', or 
+        'posterior'.
     out_root : str, optional
         Output file root for checkpoints and results (default 'tfs').
     adam_step_size : float, optional
@@ -299,13 +344,18 @@ def analyze_theta(growth_df,
     elbo_num_particles : int, optional
         Number of particles for ELBO estimation (default 2).
     convergence_tolerance : float, optional
-        Relative change in loss to declare SVI convergence (default 1e-5).
+        Relative change in loss to declare SVI convergence (default 0.01).
     convergence_window : int, optional
-        Number of steps to average for convergence check (default 1000).
+        Number of epochs to average for convergence check (default 10).
+    patience : int, optional
+        Number of consecutive checks meeting tolerance to declare convergence
+        (default 10).
+    convergence_check_interval : int, optional
+        Frequency (in epochs) to check for convergence (default 2).
     checkpoint_interval : int, optional
-        Steps between checkpoints and convergence checks (default 1000).
-    num_steps : int, optional
-        Number of SVI optimization steps (default 100000).
+        Frequency (in epochs) between checkpoints (default 10).
+    max_num_epochs : int, optional
+        Maximum number of SVI optimization epochs (default 100000).
     batch_size : int, optional
         Mini-batch size for optimization (default 1024).
     num_posterior_samples : int, optional
@@ -317,9 +367,11 @@ def analyze_theta(growth_df,
         when getting posteriors, calculate forward predictions in batches of
         this size (default 512)
     always_get_posterior : bool, optional
-        If True, always sample posteriors even if not converged (default False).
-    spiked : list, optional
-        List of genotypes to mask from theta correction (e.g. spiked-in variants).
+        If True, always generate and save posterior samples, even if the
+        optimization did not formally converge (default False).
+    spiked : list or str, optional
+        Names of genotypes that should be excluded from congression
+        correction.
 
     Returns
     -------
@@ -336,6 +388,33 @@ def analyze_theta(growth_df,
     output root. 
     """
 
+    # If config_file is provided, load settings from it. Overwrite any
+    # settings provided as arguments.
+
+    if config_file is not None:
+
+        c_growth_df, c_binding_df, c_settings = GrowthModel.load_config(config_file)
+
+        # Overwrite all other settings from the config
+        growth_df = c_growth_df
+        binding_df = c_binding_df
+        condition_growth_model = c_settings["condition_growth"]
+        ln_cfu0_model = c_settings["ln_cfu0"]
+        dk_geno_model = c_settings["dk_geno"]
+        activity_model = c_settings["activity"]
+        theta_model = c_settings["theta"]
+        transformation_model = c_settings["transformation"]
+        theta_growth_noise_model = c_settings["theta_growth_noise"]
+        theta_binding_noise_model = c_settings["theta_binding_noise"]
+        spiked = c_settings["spiked_genotypes"]
+
+    # validation
+    if growth_df is None or binding_df is None:
+        raise ValueError("growth_df and binding_df must be provided if config_file is not provided.")
+
+    if seed is None and checkpoint_file is None:
+        raise ValueError("seed must be provided unless loading from a checkpoint.")
+
     # Kind of a hack, but this forces no batching for the posterior calc
     if analysis_method == "posterior":
         batch_size = None
@@ -350,9 +429,13 @@ def analyze_theta(growth_df,
                      dk_geno=dk_geno_model,
                      activity=activity_model,
                      theta=theta_model,
+                     transformation=transformation_model,
                      theta_growth_noise=theta_growth_noise_model,
                      theta_binding_noise=theta_binding_noise_model,
                      spiked_genotypes=spiked)
+    
+    # Save the model configuration
+    gm.write_config(growth_df, binding_df, out_root)
     
     # Create a run inference object, which manages things like checking for 
     # ELBO convergence.
@@ -362,7 +445,7 @@ def analyze_theta(growth_df,
     if analysis_method == "svi":
 
         return _run_svi(ri,
-                        init_params=None,
+                        init_params=gm.init_params,
                         checkpoint_file=checkpoint_file,
                         out_root=out_root,
                         adam_step_size=adam_step_size,
@@ -371,8 +454,10 @@ def analyze_theta(growth_df,
                         elbo_num_particles=elbo_num_particles,
                         convergence_tolerance=convergence_tolerance,
                         convergence_window=convergence_window,
+                        patience=patience,
+                        convergence_check_interval=convergence_check_interval,
                         checkpoint_interval=checkpoint_interval,
-                        num_steps=num_steps,
+                        max_num_epochs=max_num_epochs,
                         num_posterior_samples=num_posterior_samples,
                         sampling_batch_size=sampling_batch_size,
                         forward_batch_size=forward_batch_size,
@@ -391,9 +476,15 @@ def analyze_theta(growth_df,
                         elbo_num_particles=elbo_num_particles,
                         convergence_tolerance=convergence_tolerance,
                         convergence_window=convergence_window,
+                        patience=patience,
+                        convergence_check_interval=convergence_check_interval,
                         checkpoint_interval=checkpoint_interval,
-                        map_num_steps=num_steps)
-    
+                        max_num_epochs=max_num_epochs,
+                        num_posterior_samples=num_posterior_samples,
+                        sampling_batch_size=sampling_batch_size,
+                        forward_batch_size=forward_batch_size,
+                        always_get_posterior=always_get_posterior)
+                          
     elif analysis_method == "posterior":
 
         return _run_svi(ri,
@@ -406,8 +497,10 @@ def analyze_theta(growth_df,
                         elbo_num_particles=elbo_num_particles,
                         convergence_tolerance=convergence_tolerance,
                         convergence_window=convergence_window,
+                        patience=patience,
+                        convergence_check_interval=convergence_check_interval,
                         checkpoint_interval=checkpoint_interval,
-                        num_steps=0, # Don't do any optimization
+                        max_num_epochs=0, # Don't do any optimization
                         num_posterior_samples=num_posterior_samples,
                         sampling_batch_size=sampling_batch_size,
                         forward_batch_size=forward_batch_size,
@@ -417,7 +510,7 @@ def analyze_theta(growth_df,
     else:
         raise ValueError(
             f"analysis method '{analysis_method}' not recognized. This should "
-            "be 'SVI', 'MAP', or 'posterior'"
+            "be 'svi', 'map', or 'posterior'"
         )
 
 
@@ -430,8 +523,11 @@ def main():
     """
 
     return generalized_main(analyze_theta,
-                            manual_arg_types={"seed":int,
+                            manual_arg_types={"growth_df":str,
+                                              "binding_df":str,
+                                              "seed":int,
                                               "checkpoint_file":str,
+                                              "config_file":str,
                                               "spiked":list},
                             manual_arg_nargs={"spiked":"+"})
 

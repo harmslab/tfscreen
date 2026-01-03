@@ -9,6 +9,7 @@ from tfscreen.analysis.hierarchical.analyze_theta import (
     _run_map,
     main
 )
+import tfscreen.analysis.hierarchical.analyze_theta as analyze_theta_mod
 
 # =============================================================================
 # Fixtures
@@ -28,6 +29,9 @@ def mock_run_inference(mocker):
     
     # run_optimization returns (svi_state, params, converged)
     mock_ri_instance.run_optimization.return_value = ("final_state", {"p": 1}, True)
+
+    # Patch summarize_posteriors globally for these tests
+    mocker.patch("tfscreen.analysis.hierarchical.analyze_theta.summarize_posteriors")
     
     return mock_ri_class, mock_ri_instance
 
@@ -54,9 +58,11 @@ def test_run_svi_flow_converged(mock_run_inference):
         ri, 
         init_params=None,
         out_root="test_root",
-        num_steps=500,
+        max_num_epochs=500,
         num_posterior_samples=100
     )
+    
+    # 1. Setup SVI
     
     # 1. Setup SVI
     ri.setup_svi.assert_called_once()
@@ -69,8 +75,10 @@ def test_run_svi_flow_converged(mock_run_inference):
         svi_state=None,
         convergence_tolerance=ANY,
         convergence_window=ANY,
+        patience=ANY,
+        convergence_check_interval=ANY,
         checkpoint_interval=ANY,
-        num_steps=500
+        max_num_epochs=500
     )
     
     # 3. Get Posteriors (because converged=True)
@@ -120,37 +128,48 @@ def test_run_map_flow(mock_run_inference):
     """Test MAP execution flow."""
     _, ri = mock_run_inference
     init_params = {"p": 10}
-    
-    with patch("os.path.isfile", return_value=True), \
-         patch("os.remove") as mock_remove:
-        
-        state, params, converged = _run_map(
-            ri,
-            init_params=init_params,
-            out_root="test_map",
-            map_num_steps=1000
-        )
-        
-        # Should delete old losses file
-        mock_remove.assert_called_once_with("test_map_losses.csv")
+    state, params, converged = _run_map(
+        ri,
+        init_params=init_params,
+        out_root="test_map",
+        max_num_epochs=1000,
+        num_posterior_samples=100
+    )
     
     # 1. Setup MAP
-    ri.setup_map.assert_called_once()
+    ri.setup_svi.assert_called_once()
     
     # 2. Run Optimization
     ri.run_optimization.assert_called_once_with(
-        "mock_map_obj",
+        "mock_svi_obj",
         init_params=init_params,
         out_root="test_map",
         svi_state=None,
         convergence_tolerance=ANY,
         convergence_window=ANY,
+        patience=ANY,
+        convergence_check_interval=ANY,
         checkpoint_interval=ANY,
-        num_steps=1000
+        max_num_epochs=1000
     )
     
     # 3. Write Params
     ri.write_params.assert_called_once_with({"p": 1}, out_root="test_map")
+
+    # 4. Get Posteriors (REMOVED from _run_map in recent cleanup)
+    ri.get_posteriors.assert_not_called()
+
+    # 5. Summarize Posteriors is called (verified by global patch if needed, 
+    # but here we just ensure flow moves forward)
+
+def test_run_map_not_converged(mock_run_inference, capsys):
+    """Test MAP not converged message."""
+    _, ri = mock_run_inference
+    ri.run_optimization.return_value = ("state", {"p": 1}, False)
+    _run_map(ri, init_params={"p": 1}, always_get_posterior=False)
+    captured = capsys.readouterr()
+    assert "MAP run converged" not in captured.out
+    assert "MAP run has not yet converged" in captured.out
 
 # =============================================================================
 # Tests for analyze_theta (Orchestrator)
@@ -188,7 +207,7 @@ def test_analyze_theta_svi_mode(mock_growth_model, mock_run_inference):
         # ri is positional arg 0
         args, kwargs = mock_run_svi.call_args
         assert args[0] == ri_inst
-        assert kwargs["init_params"] is None
+        assert kwargs["init_params"] == gm_inst.init_params
 
 def test_analyze_theta_map_mode(mock_growth_model, mock_run_inference):
     """Test analyze_theta executing MAP path."""
@@ -228,7 +247,7 @@ def test_analyze_theta_posterior_mode(mock_growth_model, mock_run_inference):
         assert args[0] == ri_inst
         
         # Check keyword overrides
-        assert kwargs["num_steps"] == 0
+        assert kwargs["max_num_epochs"] == 0
         assert kwargs["always_get_posterior"] is True
 
 def test_analyze_theta_invalid_method(mock_growth_model, mock_run_inference):
@@ -236,9 +255,57 @@ def test_analyze_theta_invalid_method(mock_growth_model, mock_run_inference):
     with pytest.raises(ValueError, match="not recognized"):
         analyze_theta("g", "b", 1, analysis_method="magic_wand")
 
-# =============================================================================
-# Tests for main
-# =============================================================================
+def test_analyze_theta_config_loading(mock_growth_model, mock_run_inference):
+    """Test analyze_theta loading from config."""
+    gm_class, gm_inst = mock_growth_model
+    
+    mock_config = {
+        "condition_growth": "independent",
+        "ln_cfu0": "hierarchical",
+        "dk_geno": "fixed",
+        "activity": "fixed",
+        "theta": "hill",
+        "transformation": "single",
+        "theta_growth_noise": "none",
+        "theta_binding_noise": "none",
+        "spiked_genotypes": ["S1"]
+    }
+    gm_class.load_config.return_value = ("cg", "cb", mock_config)
+    
+    with patch("tfscreen.analysis.hierarchical.analyze_theta._run_svi"):
+        analyze_theta(config_file="config.yaml", seed=1)
+        
+        gm_class.load_config.assert_called_once_with("config.yaml")
+        # Verify gm_class was initialized with values from config
+        kwargs = gm_class.call_args[1]
+        assert kwargs["condition_growth"] == "independent"
+        assert kwargs["spiked_genotypes"] == ["S1"]
+
+def test_analyze_theta_errors(mock_growth_model):
+    """Test analyze_theta validation errors."""
+    # No seed
+    with pytest.raises(ValueError, match="seed must be provided"):
+        analyze_theta(growth_df="g", binding_df="b", seed=None)
+    
+    # No dfs
+    with pytest.raises(ValueError, match="growth_df and binding_df must be provided"):
+        analyze_theta(growth_df=None, binding_df=None, seed=1)
+
+def test_run_svi_not_converged_stdout(mock_run_inference, capsys):
+    """Test SVI not converged message."""
+    _, ri = mock_run_inference
+    ri.run_optimization.return_value = ("state", {}, False)
+    _run_svi(ri, init_params=None)
+    captured = capsys.readouterr()
+    assert "SVI run has not yet converged." in captured.out
+
+def test_main_block(mocker):
+    """Test if main block calls main."""
+    mock_main = mocker.patch("tfscreen.analysis.hierarchical.analyze_theta.main")
+    # Simulate if __name__ == "__main__"
+    import tfscreen.analysis.hierarchical.analyze_theta as mod
+    # We can't easily trigger the true if __name__ == "__main__" block without subprocess, 
+    # but we covered the main() function itself.
 
 def test_main():
     """Test that main wraps analyze_theta correctly."""
@@ -246,6 +313,22 @@ def test_main():
         main()
         mock_gen_main.assert_called_once_with(
             analyze_theta,
-            manual_arg_types={"seed": int, "checkpoint_file": str, "spiked": list},
+            manual_arg_types={"growth_df": str,
+                              "binding_df": str,
+                              "seed": int,
+                              "checkpoint_file": str,
+                              "config_file": str,
+                              "spiked": list},
             manual_arg_nargs={"spiked": "+"}
         )
+import runpy
+import sys
+def test_main_entry_point():
+    with patch.object(sys, 'argv', ['analyze_theta', '--help']):
+        # Patch the function where it is used in the module
+        with patch("tfscreen.analysis.hierarchical.analyze_theta.generalized_main") as mock_gen:
+            try:
+                main()
+            except SystemExit:
+                pass
+            mock_gen.assert_called_once()
